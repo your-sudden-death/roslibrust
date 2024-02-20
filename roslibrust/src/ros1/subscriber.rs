@@ -1,5 +1,6 @@
 use crate::ros1::tcpros::ConnectionHeader;
 use abort_on_drop::ChildTask;
+use futures_util::{stream, Stream};
 use roslibrust_codegen::RosMessageType;
 use std::{marker::PhantomData, sync::Arc};
 use tokio::{
@@ -31,6 +32,13 @@ impl<T: RosMessageType> Subscriber<T> {
             Err(RecvError::Lagged(n)) => return Err(SubscriberError::Lagged(n)),
         };
         Ok(serde_rosmsg::from_slice(&data[..])?)
+    }
+
+    pub fn as_stream<'a>(&'a mut self) -> impl Stream<Item = Result<T, SubscriberError>> + 'a {
+        stream::unfold(self, |sub| async {
+            let next = sub.next().await.transpose()?;
+            Some((next, sub))
+        })
     }
 }
 
