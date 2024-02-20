@@ -34,8 +34,8 @@ impl<T: RosMessageType> Subscriber<T> {
         Ok(serde_rosmsg::from_slice(&data[..])?)
     }
 
-    pub fn as_stream<'a>(&'a mut self) -> impl Stream<Item = Result<T, SubscriberError>> + 'a {
-        stream::unfold(self, |sub| async {
+    pub fn into_stream(self) -> impl Stream<Item = Result<T, SubscriberError>> {
+        stream::unfold(self, |mut sub| async {
             let next = sub.next().await.transpose()?;
             Some((next, sub))
         })
