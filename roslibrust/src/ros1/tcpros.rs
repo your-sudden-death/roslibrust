@@ -1,9 +1,16 @@
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Cursor, Read, Write};
+use anyhow::anyhow;
+use byteorder::{LittleEndian, WriteBytesExt};
+use nom::{
+    bytes::complete::{take, take_until},
+    error::{make_error, ErrorKind},
+    number::complete::le_u32,
+    Finish, IResult,
+};
+use std::{io::Write, str::from_utf8};
 
 // Implementation of ConnectionHeader is based off of ROS documentation here:
 // wiki.ros.org/ROS/Connection%20Header
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConnectionHeader {
     pub caller_id: String,
     pub latching: bool,
@@ -16,63 +23,72 @@ pub struct ConnectionHeader {
 
 impl ConnectionHeader {
     pub fn from_bytes(header_data: &[u8]) -> std::io::Result<ConnectionHeader> {
-        let mut cursor = Cursor::new(header_data);
-        let header_length = cursor.read_u32::<LittleEndian>()?;
-        if header_length as usize > header_data.len() {
-            return Err(std::io::ErrorKind::InvalidInput.into());
-        }
+        Self::parse(header_data)
+            .finish()
+            .map(|(_, h)| h)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    anyhow!("{:?}, {:?}", e.code, e.input),
+                )
+            })
+    }
 
-        let mut msg_definition = String::new();
-        let mut caller_id = String::new();
-        let mut latching = false;
-        let mut md5sum = String::new();
-        let mut topic = String::new();
-        let mut topic_type = String::new();
-        let mut tcp_nodelay = false;
+    fn parse_header_field(input: &[u8]) -> IResult<&[u8], (&str, &str)> {
+        let (input, len) = le_u32(input)?;
+        let (input, field_name) = take_until("=")(input)?;
+        let (input, _eq) = take(1usize)(input)?;
+        let Some(remaining_len) = len.checked_sub(field_name.len() as u32 + 1) else {
+            log::warn!("Underflow in header bytes, nothing remaining after =");
+            return Err(nom::Err::Error(make_error(input, ErrorKind::LengthValue)));
+        };
+        let (input, value) = take(remaining_len)(input)?;
+        let Ok(field_name) = from_utf8(field_name) else {
+            log::warn!(
+                "Header Field name {} (lossy) is invalid UTF8",
+                String::from_utf8_lossy(field_name)
+            );
+            return Err(nom::Err::Error(make_error(input, ErrorKind::AlphaNumeric)));
+        };
 
-        // TODO: Unhandled: error, persistent
+        let Ok(value) = from_utf8(value) else {
+            log::warn!(
+                "Header Value {} (lossy) is invalid UTF8",
+                String::from_utf8_lossy(value)
+            );
+            return Err(nom::Err::Error(make_error(input, ErrorKind::AlphaNumeric)));
+        };
+        Ok((input, (field_name, value)))
+    }
 
-        while cursor.position() < header_data.len() as u64 {
-            let field_length = cursor.read_u32::<LittleEndian>()? as usize;
-            let mut field = vec![0u8; field_length];
-            cursor.read_exact(&mut field)?;
-            let field = String::from_utf8(field).unwrap();
-            let equals_pos = match field.find('=') {
-                Some(pos) => pos,
-                None => continue,
+    fn parse(input: &[u8]) -> IResult<&[u8], ConnectionHeader> {
+        let (mut input, mut len) = le_u32(input)?;
+
+        let mut header = ConnectionHeader::default();
+
+        while len > 0 {
+            let input_len = input.len();
+            let (shorter_input, (key, value)) = Self::parse_header_field(input)?;
+            let value = value.to_string();
+            match key {
+                "callerid" => header.caller_id = value,
+                "message_definition" => header.msg_definition = value,
+                "md5sum" => header.md5sum = value,
+                "topic" => header.topic = value,
+                "type" => header.topic_type = value,
+                "latching" => header.latching = value != "0",
+                "tcp_nodelay" => header.tcp_nodelay = value != "0",
+                _ => log::warn!("Unknown ros header field with name {} encountered", key),
             };
-            if field.starts_with("message_definition=") {
-                field[equals_pos + 1..].clone_into(&mut msg_definition);
-            } else if field.starts_with("callerid=") {
-                field[equals_pos + 1..].clone_into(&mut caller_id);
-            } else if field.starts_with("latching=") {
-                let mut latching_str = String::new();
-                field[equals_pos + 1..].clone_into(&mut latching_str);
-                latching = &latching_str != "0";
-            } else if field.starts_with("md5sum=") {
-                field[equals_pos + 1..].clone_into(&mut md5sum);
-            } else if field.starts_with("topic=") {
-                field[equals_pos + 1..].clone_into(&mut topic);
-            } else if field.starts_with("type=") {
-                field[equals_pos + 1..].clone_into(&mut topic_type);
-            } else if field.starts_with("tcp_nodelay=") {
-                let mut tcp_nodelay_str = String::new();
-                field[equals_pos + 1..].clone_into(&mut tcp_nodelay_str);
-                tcp_nodelay = &tcp_nodelay_str != "0";
-            } else {
-                log::warn!("Encountered unhandled field in connection header: {field}");
-            }
+            let diff = input_len - shorter_input.len();
+            let Some(shorter) = len.checked_sub(diff as u32) else {
+                log::warn!("Underflow in header bytes, too many bytes read");
+                return Err(nom::Err::Error(make_error(input, ErrorKind::Count)));
+            };
+            len = shorter;
+            input = shorter_input;
         }
-
-        Ok(ConnectionHeader {
-            caller_id,
-            latching,
-            msg_definition,
-            md5sum,
-            topic,
-            topic_type,
-            tcp_nodelay,
-        })
+        Ok((input, header))
     }
 
     pub fn to_bytes(&self, to_publisher: bool) -> std::io::Result<Vec<u8>> {
@@ -116,5 +132,69 @@ impl ConnectionHeader {
         }
 
         Ok(header_data)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::ConnectionHeader;
+
+    #[test]
+    fn test_header_parse() {
+        let valid_header: [u8; 180] = [
+            0xb0, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67,
+            0x65, 0x5f, 0x64, 0x65, 0x66, 0x69, 0x6e, 0x69, 0x74, 0x69, 0x6f, 0x6e, 0x3d, 0x73,
+            0x74, 0x72, 0x69, 0x6e, 0x67, 0x20, 0x64, 0x61, 0x74, 0x61, 0x0a, 0x0a, 0x25, 0x00,
+            0x00, 0x00, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x72, 0x69, 0x64, 0x3d, 0x2f, 0x72, 0x6f,
+            0x73, 0x74, 0x6f, 0x70, 0x69, 0x63, 0x5f, 0x34, 0x37, 0x36, 0x37, 0x5f, 0x31, 0x33,
+            0x31, 0x36, 0x39, 0x31, 0x32, 0x37, 0x34, 0x31, 0x35, 0x35, 0x37, 0x0a, 0x00, 0x00,
+            0x00, 0x6c, 0x61, 0x74, 0x63, 0x68, 0x69, 0x6e, 0x67, 0x3d, 0x31, 0x27, 0x00, 0x00,
+            0x00, 0x6d, 0x64, 0x35, 0x73, 0x75, 0x6d, 0x3d, 0x39, 0x39, 0x32, 0x63, 0x65, 0x38,
+            0x61, 0x31, 0x36, 0x38, 0x37, 0x63, 0x65, 0x63, 0x38, 0x63, 0x38, 0x62, 0x64, 0x38,
+            0x38, 0x33, 0x65, 0x63, 0x37, 0x33, 0x63, 0x61, 0x34, 0x31, 0x64, 0x31, 0x0e, 0x00,
+            0x00, 0x00, 0x74, 0x6f, 0x70, 0x69, 0x63, 0x3d, 0x2f, 0x63, 0x68, 0x61, 0x74, 0x74,
+            0x65, 0x72, 0x14, 0x00, 0x00, 0x00, 0x74, 0x79, 0x70, 0x65, 0x3d, 0x73, 0x74, 0x64,
+            0x5f, 0x6d, 0x73, 0x67, 0x73, 0x2f, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67,
+        ];
+
+        let parsed = ConnectionHeader::from_bytes(&valid_header).unwrap();
+        let model = ConnectionHeader {
+            caller_id: String::from("/rostopic_4767_1316912741557"),
+            latching: true,
+            msg_definition: String::from("string data\n\n"),
+            md5sum: String::from("992ce8a1687cec8c8bd883ec73ca41d1"),
+            topic: String::from("/chatter"),
+            topic_type: String::from("std_msgs/String"),
+            tcp_nodelay: false,
+        };
+
+        assert_eq!(parsed, model);
+    }
+
+    #[test]
+    fn test_header_read_write() {
+        let model_1 = ConnectionHeader {
+            caller_id: String::from("/rostopic_4861_131237898261"),
+            latching: true,
+            msg_definition: String::from("garbage data\n\n"),
+            md5sum: String::from("992ce8a1687cec8c8bd883ec8862bbf3"),
+            topic: String::from("/ros"),
+            topic_type: String::from("std_msgs/String"),
+            tcp_nodelay: true,
+        };
+
+        let bytes = model_1.to_bytes(true).unwrap();
+        let parsed_1 = ConnectionHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(model_1, parsed_1);
+
+        let bytes = model_1.to_bytes(false).unwrap();
+        let model_2 = ConnectionHeader {
+            tcp_nodelay: false,
+            ..model_1
+        };
+
+        let parsed_2 = ConnectionHeader::from_bytes(&bytes).unwrap();
+
+        assert_eq!(model_2, parsed_2);
     }
 }
