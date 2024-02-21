@@ -25,13 +25,16 @@ impl<T: RosMessageType> Subscriber<T> {
         }
     }
 
-    pub async fn next(&mut self) -> Result<Option<T>, SubscriberError> {
+    pub async fn next(&mut self) -> Option<Result<T, SubscriberError>> {
         let data = match self.receiver.recv().await {
             Ok(v) => v,
-            Err(RecvError::Closed) => return Ok(None),
-            Err(RecvError::Lagged(n)) => return Err(SubscriberError::Lagged(n)),
+            Err(RecvError::Closed) => return None,
+            Err(RecvError::Lagged(n)) => return Some(Err(SubscriberError::Lagged(n))),
         };
-        Ok(serde_rosmsg::from_slice(&data[..])?)
+        match serde_rosmsg::from_slice::<T>(&data[..]) {
+            Ok(p) => Some(Ok(p)),
+            Err(e) => Some(Err(e.into())),
+        }
     }
 
     pub fn into_stream(self) -> impl Stream<Item = Result<T, SubscriberError>> {
