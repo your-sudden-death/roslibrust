@@ -39,7 +39,7 @@ impl<T: RosMessageType> Subscriber<T> {
 
     pub fn into_stream(self) -> impl Stream<Item = Result<T, SubscriberError>> {
         stream::unfold(self, |mut sub| async {
-            let next = sub.next().await.transpose()?;
+            let next = sub.next().await?;
             Some((next, sub))
         })
     }
